@@ -5,8 +5,27 @@ import torch
 from decode_matmul_cuda import decode_matmul as decode_matmul_cuda
 
 
-Mask1 = sum(torch.tensor(1,dtype=torch.int64) << (i*8) for i in range(8))
-Mask2 = sum(torch.tensor(2,dtype=torch.int64) << (i*8) for i in range(8))
+class Benchmark:
+    def __init__(self, name, show):
+        self.name = name
+        self.show = show
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+
+    def __enter__(self):
+        self.start_event.record()
+        return self.start_event
+
+    def __exit__(self, type, value, traceback):
+        self.end_event.record()
+        torch.cuda.synchronize()
+        elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
+        if self.show:
+            print(f"[{self.name.ljust(8)}] Elapsed: {elapsed_time_ms:.4f}ms")
+
+
+Mask1 = sum(torch.tensor(1, dtype=torch.int64) << (i*8) for i in range(8))
+Mask2 = sum(torch.tensor(2, dtype=torch.int64) << (i*8) for i in range(8))
 
 
 def decode(weight_compressed, codebook_abs, codebook_sign):
@@ -105,14 +124,15 @@ def test_decode_matmul():
     codebook_abs = build_codebook_abs(device)
     codebook_sign = build_codebook_sign(device)
 
-    result_torch = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign)
-    print(result_torch)
+    for i in range(3):
+        with Benchmark("Torch", i == 2):
+            result_torch = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign)
 
-    result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs, codebook_sign)
-    print(result_cuda)
+        with Benchmark("CUDA", i == 2):
+            result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs, codebook_sign)
 
-    print(result_torch - result_cuda)
-    print(torch.all(result_torch == result_cuda))
+        if i == 2:
+            print("Correct:", torch.all(result_torch == result_cuda))
 
 
 if __name__ == '__main__':
