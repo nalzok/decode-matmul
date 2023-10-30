@@ -21,7 +21,7 @@ class Benchmark:
         torch.cuda.synchronize()
         elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
         if self.show:
-            print(f"[{self.name.ljust(8)}] Elapsed: {elapsed_time_ms:.4f}ms")
+            print(f"[{self.name.ljust(16)}] Elapsed: {elapsed_time_ms:.4f}ms")
 
 
 Mask1 = sum(torch.tensor(1, dtype=torch.int64) << (i*8) for i in range(8))
@@ -67,7 +67,7 @@ def decode_naive(weight_compressed, codebook_abs, codebook_sign):
     return decoded
 
 
-def decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign):
+def decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decoder_impl):
     M, K = x.shape
     N, _ = weights_compressed.shape
 
@@ -76,7 +76,7 @@ def decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign):
         for j in range(N):
             for k in range(K // 8):
                 weight_compressed = weights_compressed[j, k]
-                weight = decode_naive(weight_compressed, codebook_abs, codebook_sign)
+                weight = decoder_impl(weight_compressed, codebook_abs, codebook_sign)
                 for kk in range(8):
                     result[i, j] += x[i, 8*k+kk] * weight[kk]
 
@@ -125,14 +125,18 @@ def test_decode_matmul():
     codebook_sign = build_codebook_sign(device)
 
     for i in range(3):
-        with Benchmark("Torch", i == 2):
-            result_torch = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign)
+        with Benchmark("Torch-naive", i == 2):
+            result_torch_naive = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decode_naive)
+
+        with Benchmark("Torch-bitwise", i == 2):
+            result_torch_bitwise = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decode)
 
         with Benchmark("CUDA", i == 2):
             result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs, codebook_sign)
 
         if i == 2:
-            print("Correct:", torch.all(result_torch == result_cuda))
+            print("Correct (bitwise):", torch.all(result_torch_bitwise == result_cuda).item())
+            print("Correct (CUDA):", torch.all(result_torch_naive == result_cuda).item())
 
 
 if __name__ == '__main__':
