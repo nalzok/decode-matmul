@@ -126,7 +126,7 @@ def test_decode_matmul():
     codebook_sign = build_codebook_sign(device)
 
 
-    M, N, K = 8 * 2, 32 * 3, 16 * 8
+    M, N, K = 8 * 2, 32 * 3, 16 * 5
     x, weights_compressed = build_x_weights(M, N, K, device)
 
     result_torch_naive = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decode_naive)

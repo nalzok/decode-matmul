@@ -70,11 +70,11 @@ __global__ static void decode_matmul_kernel(
 
     for (int64_t block_pos = blockIdx.x; ; block_pos += gridDim.x) {
         int64_t warp_pos = block_pos * blockDim.x/WARP_SIZE + warpId;
-        int64_t WARP_M = warp_pos / (TILES_N * TILES_K);
-        int64_t WARP_N = warp_pos % (TILES_N * TILES_K) / TILES_K;
-        int64_t WARP_K = warp_pos % TILES_K;
+        int64_t WARP_K = warp_pos / (TILES_M * TILES_N);
+        int64_t WARP_M = warp_pos % (TILES_M * TILES_N) / TILES_N;
+        int64_t WARP_N = warp_pos % TILES_N;
 
-        if (WARP_M >= TILES_M) {
+        if (WARP_K >= TILES_K) {
             break;
         }
 
@@ -163,8 +163,6 @@ __host__ torch::Tensor decode_matmul(
     smem_size += (block_size/WARP_SIZE) * WMMA_M * WMMA_N * sizeof(int32_t);
     TORCH_CHECK_LE(smem_size, SMEM_SIZE_MAX);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
-
-    TORCH_CHECK(GLOBAL_K % (WMMA_K * block_size/WARP_SIZE) == 0, "A block may cover multiple tiles in the result matrix");
 
     decode_matmul_kernel<<<grid_size, block_size, smem_size, stream>>>(
             output.data_ptr<int32_t>(),
