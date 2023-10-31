@@ -23,7 +23,7 @@ using namespace nvcuda;
 
 #define WARP_SIZE               32
 
-#define SMEM_SIZE               (48 * 1024)
+#define SMEM_SIZE_MAX           (48 * 1024)
 
 
 __host__ static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -78,21 +78,22 @@ __global__ static void decode_matmul_kernel(
             wmma::load_matrix_sync(a_frag, x + aRow*GLOBAL_K + aCol, GLOBAL_K);
 
             int64_t bRow = WARP_N * WMMA_N;
-            int64_t bCol = k;
+            int64_t bCol = k / 8;
 
-            for (int64_t i = bRow; i < bRow + WMMA_N; i += 1) {
-                for (int64_t j = bCol + 8 * laneId; j < bCol + WMMA_K; j += 8 * WARP_SIZE) {
-                    int16_t weight_compressed = weights_compressed[i * (GLOBAL_K/8) + j/8];
-                    int16_t bits_abs = weight_compressed & ((1 << 8) - 1);
-                    int16_t bits_sign = (weight_compressed >> 8) & ((1 << 7) - 1);
-                    bool bit_shift = (weight_compressed >> 15) & ((1 << 1) - 1);
+            for (int64_t i = laneId; i < WMMA_N * WMMA_K/8; i += WARP_SIZE) {
+                int64_t THREAD_M = i / (WMMA_K/8);
+                int64_t THREAD_K = i % (WMMA_K/8);
 
-                    int64_t packed = codebook_abs[bits_abs] ^ codebook_sign[bits_sign];
-                    packed -= bit_shift * 0x0202020202020202;
-                    packed |= 0x0101010101010101;
+                int16_t weight_compressed = weights_compressed[(bRow + THREAD_M) * (GLOBAL_K/8) + bCol + THREAD_K];
+                int16_t bits_abs = weight_compressed & ((1 << 8) - 1);
+                int16_t bits_sign = (weight_compressed >> 8) & ((1 << 7) - 1);
+                bool bit_shift = (weight_compressed >> 15) & ((1 << 1) - 1);
 
-                    decoded[(i-bRow)*(WMMA_K/8) + (j-bCol)/8] = packed;   // little-endian
-                }
+                int64_t packed = codebook_abs[bits_abs] ^ codebook_sign[bits_sign];
+                packed -= bit_shift * 0x0202020202020202;
+                packed |= 0x0101010101010101;
+
+                decoded[THREAD_M*(WMMA_K/8) + THREAD_K] = packed;   // little-endian
             }
 
             wmma::load_matrix_sync(b_frag, reinterpret_cast<int8_t *>(decoded), WMMA_K);
@@ -124,11 +125,15 @@ __host__ torch::Tensor decode_matmul(
     TORCH_CHECK(codebook_sign.scalar_type() == torch::kInt64);
     TORCH_CHECK(x.size(-1) == weights_compressed.size(-1) << 3);
 
-    at::DeviceGuard guard(x.device());
-
     int64_t GLOBAL_M = x.size(-2);
     int64_t GLOBAL_N = weights_compressed.size(-2);
     int64_t GLOBAL_K = x.size(-1);
+
+    TORCH_CHECK(GLOBAL_M % WMMA_M == 0, "GLOBAL_M is not divisible by WMMA_M");
+    TORCH_CHECK(GLOBAL_N % WMMA_N == 0, "GLOBAL_N is not divisible by WMMA_N");
+    TORCH_CHECK(GLOBAL_K % WMMA_K == 0, "GLOBAL_K is not divisible by WMMA_K");
+
+    at::DeviceGuard guard(x.device());
     torch::TensorOptions options = torch::TensorOptions()
         .dtype(torch::kInt32)
         .layout(torch::kStrided)
@@ -138,8 +143,12 @@ __host__ torch::Tensor decode_matmul(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, x.get_device());
+    int64_t block_size = 256;
+    int64_t smem_size = (block_size / WARP_SIZE) * WMMA_N * (WMMA_K / 8) * sizeof(int64_t);
+    TORCH_CHECK_LE(smem_size, SMEM_SIZE_MAX);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
-    decode_matmul_kernel<<<deviceProp.multiProcessorCount, 256, SMEM_SIZE, stream>>>(
+
+    decode_matmul_kernel<<<deviceProp.multiProcessorCount, block_size, smem_size, stream>>>(
             output.data_ptr<int32_t>(),
             x.data_ptr<int8_t>(),
             weights_compressed.data_ptr<int16_t>(),
