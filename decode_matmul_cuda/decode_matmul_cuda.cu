@@ -49,62 +49,76 @@ __global__ static void decode_matmul_kernel(
     int64_t warpId = threadIdx.x / WARP_SIZE;
     int64_t laneId = threadIdx.x % WARP_SIZE;
 
-    extern __shared__ __align__(sizeof(int64_t)) char decoded_block_raw[];
-    int64_t *decoded_block = reinterpret_cast<int64_t *>(decoded_block_raw);
-    int64_t *decoded = decoded_block + warpId * WMMA_N * WMMA_K / 8;
+    extern __shared__ __align__(sizeof(int64_t)) char raw[];
+    int64_t *decoded_block = reinterpret_cast<int64_t *>(raw);
+    int64_t *decoded = decoded_block + warpId * WMMA_N * WMMA_K/8;
+
+    int64_t offset = blockDim.x/WARP_SIZE * WMMA_N * WMMA_K/8 * sizeof(int64_t);
+    int32_t *result_block = reinterpret_cast<int32_t *>(raw + offset);
+    int32_t *result = result_block + warpId * WMMA_M * WMMA_N;
+    for (int64_t i = laneId; i < WMMA_M * WMMA_N; i += WARP_SIZE) {
+        result[i] = 0;
+    }
 
     int64_t TILES_M = GLOBAL_M / WMMA_M;
     int64_t TILES_N = GLOBAL_N / WMMA_N;
+    int64_t TILES_K = GLOBAL_K / WMMA_K;
 
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc_frag;
 
     for (int64_t block_pos = blockIdx.x; ; block_pos += gridDim.x) {
-        int64_t warp_pos = block_pos / WARP_SIZE + warpId;
-        int64_t WARP_M = warp_pos / TILES_N;
-        int64_t WARP_N = warp_pos % TILES_N;
+        int64_t warp_pos = block_pos * blockDim.x/WARP_SIZE + warpId;
+        int64_t WARP_M = warp_pos / (TILES_N * TILES_K);
+        int64_t WARP_N = warp_pos % (TILES_N * TILES_K) / TILES_K;
+        int64_t WARP_K = warp_pos % TILES_K;
 
         if (WARP_M >= TILES_M) {
             break;
         }
 
+        int64_t aRow = WARP_M * WMMA_M;
+        int64_t aCol = WARP_K * WMMA_K;
+        wmma::load_matrix_sync(a_frag, x + aRow*GLOBAL_K + aCol, GLOBAL_K);
+
+        int64_t bRow = WARP_N * WMMA_N;
+        int64_t bCol = WARP_K * WMMA_K/8;
+        for (int64_t i = laneId; i < WMMA_N * WMMA_K/8; i += WARP_SIZE) {
+            int64_t THREAD_M = i / (WMMA_K/8);
+            int64_t THREAD_K = i % (WMMA_K/8);
+
+            int16_t weight_compressed = weights_compressed[(bRow+THREAD_M) * (GLOBAL_K/8) + (bCol+THREAD_K)];
+            int16_t bits_abs = weight_compressed & ((1 << 8) - 1);
+            int16_t bits_sign = (weight_compressed >> 8) & ((1 << 7) - 1);
+            bool bit_shift = (weight_compressed >> 15) & ((1 << 1) - 1);
+
+            int64_t packed = codebook_abs[bits_abs] ^ codebook_sign[bits_sign];
+            packed -= bit_shift * 0x0202020202020202;
+            packed |= 0x0101010101010101;
+
+            decoded[i] = packed;   // little-endian
+        }
+        wmma::load_matrix_sync(b_frag, reinterpret_cast<int8_t *>(decoded), WMMA_K);
+
         wmma::fill_fragment(acc_frag, 0);
 
-        for (int64_t k = 0; k < GLOBAL_K; k += WMMA_K) {
-            int64_t aRow = WARP_M * WMMA_M;
-            int64_t aCol = k;
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
 
-            wmma::load_matrix_sync(a_frag, x + aRow*GLOBAL_K + aCol, GLOBAL_K);
+        wmma::store_matrix_sync(result, acc_frag, WMMA_N, wmma::mem_row_major);
 
-            int64_t bRow = WARP_N * WMMA_N;
-            int64_t bCol = k / 8;
+        // __syncthreads();
 
-            for (int64_t i = laneId; i < WMMA_N * WMMA_K/8; i += WARP_SIZE) {
-                int64_t THREAD_M = i / (WMMA_K/8);
-                int64_t THREAD_K = i % (WMMA_K/8);
-
-                int16_t weight_compressed = weights_compressed[(bRow + THREAD_M) * (GLOBAL_K/8) + bCol + THREAD_K];
-                int16_t bits_abs = weight_compressed & ((1 << 8) - 1);
-                int16_t bits_sign = (weight_compressed >> 8) & ((1 << 7) - 1);
-                bool bit_shift = (weight_compressed >> 15) & ((1 << 1) - 1);
-
-                int64_t packed = codebook_abs[bits_abs] ^ codebook_sign[bits_sign];
-                packed -= bit_shift * 0x0202020202020202;
-                packed |= 0x0101010101010101;
-
-                decoded[THREAD_M*(WMMA_K/8) + THREAD_K] = packed;   // little-endian
-            }
-
-            wmma::load_matrix_sync(b_frag, reinterpret_cast<int8_t *>(decoded), WMMA_K);
-
-            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-        }
+        // TODO: aggregate result together, and call atomicAdd in the first warp
 
         int64_t cRow = WARP_M * WMMA_M;
         int64_t cCol = WARP_N * WMMA_N;
+        for (int64_t i = laneId; i < WMMA_M * WMMA_N; i += WARP_SIZE) {
+            int64_t cRowThread = cRow + i / WMMA_N;
+            int64_t cColThread = cCol + i % WMMA_N;
 
-        wmma::store_matrix_sync(output + cRow*GLOBAL_N + cCol, acc_frag, GLOBAL_N, wmma::mem_row_major);
+            atomicAdd(output + cRowThread*GLOBAL_N + cColThread, result[i]);
+        }
     }
 }
 
@@ -143,12 +157,16 @@ __host__ torch::Tensor decode_matmul(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, x.get_device());
+    int64_t grid_size = 2 * static_cast<int64_t>(deviceProp.multiProcessorCount);
     int64_t block_size = 256;
-    int64_t smem_size = (block_size / WARP_SIZE) * WMMA_N * (WMMA_K / 8) * sizeof(int64_t);
+    int64_t smem_size = (block_size/WARP_SIZE) * WMMA_N * (WMMA_K/8) * sizeof(int64_t);
+    smem_size += (block_size/WARP_SIZE) * WMMA_M * WMMA_N * sizeof(int32_t);
     TORCH_CHECK_LE(smem_size, SMEM_SIZE_MAX);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
-    decode_matmul_kernel<<<deviceProp.multiProcessorCount, block_size, smem_size, stream>>>(
+    TORCH_CHECK(GLOBAL_K % (WMMA_K * block_size/WARP_SIZE) == 0, "A block may cover multiple tiles in the result matrix");
+
+    decode_matmul_kernel<<<grid_size, block_size, smem_size, stream>>>(
             output.data_ptr<int32_t>(),
             x.data_ptr<int8_t>(),
             weights_compressed.data_ptr<int16_t>(),
