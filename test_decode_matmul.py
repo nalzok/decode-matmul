@@ -126,7 +126,7 @@ def test_decode_matmul():
             result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
 
 
-    M, N, K = 8 * 2, 16 * 3, 32 * 5
+    M, N, K = 8 * 2, 16 * 3, 32 * 4
     x, weights_compressed = build_x_weights(M, N, K, device)
 
     transposed = transpose_tile(weights_compressed)

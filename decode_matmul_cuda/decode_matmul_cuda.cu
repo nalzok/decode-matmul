@@ -23,6 +23,7 @@ using namespace nvcuda;
 
 #define BLOCK_SIZE              1024
 #define WARP_SIZE               32
+#define PREFETCH_DIST           2
 
 #define SMEM_SIZE_MAX           (48 * 1024)
 
@@ -77,6 +78,9 @@ decode_matmul_kernel(
     __shared__ uint32_t shared_scratch[BLOCK_SIZE/WARP_SIZE * MMA_M*MMA_N];
     uint32_t* local_scratch = shared_scratch + warpId * MMA_M*MMA_N;
 
+    __shared__ uint64_t prefetch_x[PREFETCH_DIST * (BLOCK_SIZE+1)];
+    __shared__ uint32_t prefetch_weights_compressed_two[PREFETCH_DIST * (BLOCK_SIZE+1)];
+
     int64_t TILES_M = GLOBAL_M / MMA_M;
     int64_t TILES_N = GLOBAL_N / MMA_N;
     int64_t TILES_K = GLOBAL_K / MMA_K;
@@ -89,13 +93,37 @@ decode_matmul_kernel(
         int64_t M_TILE = blockPos / TILES_N;
         int64_t N_TILE = blockPos % TILES_N;
 
-        for (int64_t K_TILE = warpId; K_TILE < TILES_K; K_TILE += BLOCK_SIZE/WARP_SIZE) {
+        // fill the prefetch buffer
+        for (int64_t cursor = 0; cursor < PREFETCH_DIST; cursor += 1) {
+            int64_t K_TILE = warpId + cursor * BLOCK_SIZE/WARP_SIZE;
+
+            int64_t bRow = M_TILE * MMA_M + (laneId/4);
+            int64_t bCol = K_TILE * MMA_K + 8 * (laneId%4);
+            prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint64_t *>(x + bRow*GLOBAL_K + bCol);
+
             int64_t aRow = N_TILE * MMA_N;
             int64_t aCol = K_TILE * MMA_K/8;
-
-            // load two compressed weights at a time, each representing eight weight in int8
             uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
-            uint32_t weight_compressed_two = *reinterpret_cast<const uint32_t *>(weights_compressed + offset);
+            prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint32_t *>(weights_compressed + offset);
+        }
+
+        for (int64_t K_TILE = warpId; K_TILE < TILES_K; K_TILE += BLOCK_SIZE/WARP_SIZE) {
+            int64_t cursor = K_TILE / (BLOCK_SIZE/WARP_SIZE) % PREFETCH_DIST;
+
+            *reinterpret_cast<uint64_t *>(B) = prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x];
+            uint32_t weight_compressed_two = prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x];
+
+            int64_t K_TILE_NEXT = K_TILE + PREFETCH_DIST * BLOCK_SIZE/WARP_SIZE;
+            if (K_TILE_NEXT < TILES_K) {
+                int64_t bRow = M_TILE * MMA_M + (laneId/4);
+                int64_t bCol = K_TILE_NEXT * MMA_K + 8 * (laneId%4);
+                prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint64_t *>(x + bRow*GLOBAL_K + bCol);
+
+                int64_t aRow = N_TILE * MMA_N;
+                int64_t aCol = K_TILE_NEXT * MMA_K/8;
+                uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
+                prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint32_t *>(weights_compressed + offset);
+            }
 
             uint64_t decoded1 = decode8weights(weight_compressed_two & 0xFFFF, codebook_abs);
             uint64_t decoded2 = decode8weights((weight_compressed_two >> 16) & 0xFFFF, codebook_abs);
@@ -104,10 +132,6 @@ decode_matmul_kernel(
             A[1] = decoded2;
             A[2] = decoded1 >> 32;
             A[3] = decoded2 >> 32;
-
-            int64_t bRow = M_TILE * MMA_M + (laneId / 4);
-            int64_t bCol = K_TILE * MMA_K + 8 * (laneId % 4);
-            *reinterpret_cast<uint64_t *>(B) = *reinterpret_cast<const uint64_t *>(x + bRow*GLOBAL_K + bCol);
 
             asm(
                 "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"
@@ -162,7 +186,7 @@ __host__ torch::Tensor decode_matmul(
 
     TORCH_CHECK(GLOBAL_M % MMA_M == 0, "GLOBAL_M is not divisible by MMA_M");
     TORCH_CHECK(GLOBAL_N % MMA_N == 0, "GLOBAL_N is not divisible by MMA_N");
-    TORCH_CHECK(GLOBAL_K % MMA_K == 0, "GLOBAL_K is not divisible by MMA_K");
+    TORCH_CHECK(GLOBAL_K % (MMA_K * PREFETCH_DIST) == 0, "GLOBAL_K is not divisible by (MMA_K * PREFETCH_DIST)");
 
     at::DeviceGuard guard(x.device());
     torch::TensorOptions options = torch::TensorOptions()
