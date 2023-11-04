@@ -26,29 +26,19 @@ Mask1 = sum(torch.tensor(1, dtype=torch.int64) << (i*8) for i in range(8))
 Mask2 = sum(torch.tensor(2, dtype=torch.int64) << (i*8) for i in range(8))
 
 
-def decode(weight_compressed, codebook_abs, codebook_sign):
-    x = codebook_abs[weight_compressed & ((1 << 8) - 1)]
-    x = x ^ codebook_sign[(weight_compressed >> 8) & ((1 << 7) - 1)]
-    if (weight_compressed & (1 << 15)):
-        x = x - Mask2
-    x = x | Mask1
-    decoded = torch.tensor([(x >> (8*i)) & ((1 << 8) - 1) for i in range(8)], dtype=torch.uint8).to(torch.int8).to(torch.int32)
-    return decoded
-
-
-def decode_naive(weight_compressed, codebook_abs, codebook_sign):
+def decode(weight_compressed, codebook_abs):
     bits_abs = weight_compressed & ((1 << 8) - 1)
     bits_sign = (weight_compressed >> 8) & ((1 << 7) - 1)
+    bits_sign |= (bits_sign.item().bit_count() & 1) << 7
     bit_shift = (weight_compressed >> 15) & ((1 << 1) - 1)
 
     abs = codebook_abs[bits_abs].item()
-    sign = codebook_sign[bits_sign].item()
     decoded = torch.empty(8, dtype=torch.int8, device=weight_compressed.device)
     for i in range(8):
         value = torch.tensor(abs & 0xFF, dtype=torch.uint8).to(torch.int8)
         assert value % 1 == 0
 
-        if sign & 0xFF:
+        if bits_sign & 1:
             value *= -1
 
         if bit_shift:
@@ -58,14 +48,14 @@ def decode_naive(weight_compressed, codebook_abs, codebook_sign):
 
         decoded[i] = value
         abs >>= 8
-        sign >>= 8
+        bits_sign >>= 1
 
     decoded = decoded.to(torch.int8).to(torch.int32)
 
     return decoded
 
 
-def decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decoder_impl):
+def decode_matmul_torch(x, weights_compressed, codebook_abs):
     M, K = x.shape
     N, _ = weights_compressed.shape
 
@@ -74,7 +64,7 @@ def decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, deco
         for j in range(N):
             for k in range(K // 8):
                 weight_compressed = weights_compressed[j, k]
-                weight = decoder_impl(weight_compressed, codebook_abs, codebook_sign)
+                weight = decode(weight_compressed, codebook_abs)
                 for kk in range(8):
                     result[i, j] += x[i, 8*k+kk] * weight[kk]
 
@@ -96,17 +86,6 @@ def build_codebook_abs(device):
     return E8_CBL.to(device)
 
 
-def build_codebook_sign(device):
-    E8_SignMask = torch.zeros(2, 2, 2, 2, 2, 2, 2, dtype=torch.int64, device=device)
-    sm = ((torch.tensor(1, dtype=torch.int64, device=device) << 6) - 1) << 2
-    rsh = (2,)
-    for i in range(7):
-        E8_SignMask = E8_SignMask ^ torch.tensor([0,((sm << (8*i)) ^ (sm << (8*7)))], device=device).view(rsh)
-        rsh = rsh + (1,)
-    E8_SignMask = E8_SignMask.reshape(128)
-    return E8_SignMask
-
-
 def build_x_weights(M, N, K, device):
     int8_iinfo = torch.iinfo(torch.int8)
     int16_iinfo = torch.iinfo(torch.int16)
@@ -123,17 +102,6 @@ def test_decode_matmul():
     device = torch.device("cuda")
 
     codebook_abs = build_codebook_abs(device)
-    codebook_sign = build_codebook_sign(device)
-
-
-    M, N, K = 8 * 2, 32 * 3, 16 * 5
-    x, weights_compressed = build_x_weights(M, N, K, device)
-
-    result_torch_naive = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decode_naive)
-    result_torch_bitwise = decode_matmul_torch(x, weights_compressed, codebook_abs, codebook_sign, decode)
-    result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs, codebook_sign)
-    print("Correct (bitwise):", torch.all(result_torch_bitwise == result_cuda).item())
-    print("Correct (CUDA):", torch.all(result_torch_naive == result_cuda).item())
 
 
     M, N, K = 8, 8192, 8192
@@ -141,7 +109,15 @@ def test_decode_matmul():
 
     for _ in range(3):
         with Benchmark("CUDA"):
-            result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs, codebook_sign)
+            result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
+
+
+    M, N, K = 8 * 2, 32 * 3, 16 * 5
+    x, weights_compressed = build_x_weights(M, N, K, device)
+
+    result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
+    result_naive = decode_matmul_torch(x, weights_compressed, codebook_abs)
+    print("Correct:", torch.all(result_cuda == result_naive).item())
 
 
 if __name__ == '__main__':
