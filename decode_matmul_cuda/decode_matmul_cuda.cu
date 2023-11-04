@@ -17,9 +17,9 @@ using namespace nvcuda;
 #define CHECK_INPUT(x) 	        do { CHECK_CUDA(x); CHECK_CONTIGUOUS(x); } while(false)
 #define gpuErrchk(ans)          do { gpuAssert((ans), __FILE__, __LINE__); } while (false)
 
-#define WMMA_M                  8
-#define WMMA_N                  32
-#define WMMA_K                  16
+#define MMA_M                   8
+#define MMA_N                   16
+#define MMA_K                   32
 
 #define BLOCK_SIZE              1024
 #define WARP_SIZE               32
@@ -74,54 +74,74 @@ decode_matmul_kernel(
     int64_t warpId = threadIdx.x / WARP_SIZE;
     int64_t laneId = threadIdx.x % WARP_SIZE;
 
-    constexpr size_t SMEM_SIZE_PER_WARP = std::max(WMMA_N*WMMA_K / 8, WMMA_M*WMMA_N / 2);
-    __shared__ uint64_t shared_scratch[BLOCK_SIZE/WARP_SIZE * SMEM_SIZE_PER_WARP];
-    uint64_t* local_scratch = shared_scratch + warpId * SMEM_SIZE_PER_WARP;
+    __shared__ uint32_t shared_scratch[BLOCK_SIZE/WARP_SIZE * MMA_M*MMA_N];
+    uint32_t* local_scratch = shared_scratch + warpId * MMA_M*MMA_N;
 
-    int64_t TILES_M = GLOBAL_M / WMMA_M;
-    int64_t TILES_N = GLOBAL_N / WMMA_N;
-    int64_t TILES_K = GLOBAL_K / WMMA_K;
+    int64_t TILES_M = GLOBAL_M / MMA_M;
+    int64_t TILES_N = GLOBAL_N / MMA_N;
+    int64_t TILES_K = GLOBAL_K / MMA_K;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc_frag;
+    uint32_t A[4];
+    uint32_t B[2];
+    int32_t C[4] = {};
 
     for (int64_t blockPos = blockIdx.x; blockPos < TILES_M * TILES_N; blockPos += gridDim.x) {
         int64_t M_TILE = blockPos / TILES_N;
         int64_t N_TILE = blockPos % TILES_N;
 
-        wmma::fill_fragment(acc_frag, 0);
-
         for (int64_t K_TILE = warpId; K_TILE < TILES_K; K_TILE += BLOCK_SIZE/WARP_SIZE) {
-            int64_t aRow = M_TILE * WMMA_M;
-            int64_t aCol = K_TILE * WMMA_K;
-            wmma::load_matrix_sync(a_frag, x + aRow*GLOBAL_K + aCol, GLOBAL_K);
+            int64_t aRow = N_TILE * MMA_N;
+            int64_t aCol = K_TILE * MMA_K/8;
 
-            int64_t bRow = N_TILE * WMMA_N;
-            int64_t bCol = K_TILE * WMMA_K/8;
-            for (int64_t i = laneId; i < WMMA_N * WMMA_K/8; i += WARP_SIZE) {
-                int64_t THREAD_N = i / (WMMA_K/8);
-                int64_t THREAD_K = i % (WMMA_K/8);
-                uint16_t weight_compressed = weights_compressed[(bRow+THREAD_N) * (GLOBAL_K/8) + (bCol+THREAD_K)];
-                local_scratch[i] = decode8weights(weight_compressed, codebook_abs);
-            }
-            wmma::load_matrix_sync(b_frag, reinterpret_cast<int8_t *>(local_scratch), WMMA_K);
+            uint16_t weight_compressed = weights_compressed[(aRow + (laneId/4)) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2))];
+            uint64_t decoded = decode8weights(weight_compressed, codebook_abs);
+            A[0] = laneId & 1 ? decoded >> 32 : decoded;    // we are wasting half of the computation here
 
-            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            weight_compressed = weights_compressed[(aRow + (laneId/4) + 8) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2))];
+            decoded = decode8weights(weight_compressed, codebook_abs);
+            A[1] = laneId & 1 ? decoded >> 32 : decoded;
+
+            weight_compressed = weights_compressed[(aRow + (laneId/4)) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2) + 2)];
+            decoded = decode8weights(weight_compressed, codebook_abs);
+            A[2] = laneId & 1 ? decoded >> 32 : decoded;
+
+            weight_compressed = weights_compressed[(aRow + (laneId/4) + 8) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2) + 2)];
+            decoded = decode8weights(weight_compressed, codebook_abs);
+            A[3] = laneId & 1 ? decoded >> 32 : decoded;
+
+            int64_t bRow = M_TILE * MMA_M + (laneId / 4);
+            int64_t bCol = K_TILE * MMA_K + 4 * (laneId % 4);
+            B[0] = reinterpret_cast<const uint32_t *>(x + bRow*GLOBAL_K + bCol)[0];
+            B[1] = reinterpret_cast<const uint32_t *>(x + bRow*GLOBAL_K + bCol + 16)[0];
+
+            asm(
+                "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"
+                " { %0, %1, %2, %3 },"
+                " { %4, %5, %6, %7 },"
+                " { %8, %9 },"
+                " { %10, %11, %12, %13 };\n"
+                : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3])
+            );
         }
 
-        wmma::store_matrix_sync(reinterpret_cast<int32_t *>(local_scratch), acc_frag, WMMA_N, wmma::mem_row_major);
+        local_scratch[laneId%4 * 2 * MMA_N + laneId/4] = C[0];
+        local_scratch[laneId%4 * 2 * MMA_N + MMA_N + laneId/4] = C[1];
+        local_scratch[laneId%4 * 2 * MMA_N + laneId/4+8] = C[2];
+        local_scratch[laneId%4 * 2 * MMA_N + MMA_N + laneId/4+8] = C[3];
 
         __syncthreads();
 
-        for (int64_t i = threadIdx.x; i < WMMA_M * WMMA_N; i += BLOCK_SIZE) {
+        for (int64_t i = threadIdx.x; i < MMA_M * MMA_N; i += BLOCK_SIZE) {
             int32_t acc = 0;
             for (int64_t j = 0; j < BLOCK_SIZE/WARP_SIZE; j += 1) {
-                acc += reinterpret_cast<int32_t *>(shared_scratch)[j * WMMA_M * WMMA_N + i];
+                acc += shared_scratch[j * MMA_M * MMA_N + i];
             }
 
-            int64_t cRow = M_TILE * WMMA_M + i / WMMA_N;
-            int64_t cCol = N_TILE * WMMA_N + i % WMMA_N;
+            int64_t cRow = M_TILE * MMA_M + i / MMA_N;
+            int64_t cCol = N_TILE * MMA_N + i % MMA_N;
             output[cRow*GLOBAL_N + cCol] = acc;
         }
     }
@@ -145,9 +165,9 @@ __host__ torch::Tensor decode_matmul(
     int64_t GLOBAL_N = weights_compressed.size(-2);
     int64_t GLOBAL_K = x.size(-1);
 
-    TORCH_CHECK(GLOBAL_M % WMMA_M == 0, "GLOBAL_M is not divisible by WMMA_M");
-    TORCH_CHECK(GLOBAL_N % WMMA_N == 0, "GLOBAL_N is not divisible by WMMA_N");
-    TORCH_CHECK(GLOBAL_K % WMMA_K == 0, "GLOBAL_K is not divisible by WMMA_K");
+    TORCH_CHECK(GLOBAL_M % MMA_M == 0, "GLOBAL_M is not divisible by MMA_M");
+    TORCH_CHECK(GLOBAL_N % MMA_N == 0, "GLOBAL_N is not divisible by MMA_N");
+    TORCH_CHECK(GLOBAL_K % MMA_K == 0, "GLOBAL_K is not divisible by MMA_K");
 
     at::DeviceGuard guard(x.device());
     torch::TensorOptions options = torch::TensorOptions()
