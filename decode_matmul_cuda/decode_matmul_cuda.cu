@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cuda.h>
+#include <cuda_pipeline_primitives.h>
 #include <mma.h>
 
 #include <ATen/ATen.h>
@@ -99,17 +100,20 @@ decode_matmul_kernel(
 
             int64_t bRow = M_TILE * MMA_M + (laneId/4);
             int64_t bCol = K_TILE * MMA_K + 8 * (laneId%4);
-            prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint64_t *>(x + bRow*GLOBAL_K + bCol);
+            __pipeline_memcpy_async(prefetch_x + cursor*(BLOCK_SIZE+1) + threadIdx.x, x + bRow*GLOBAL_K + bCol, 8);
 
             int64_t aRow = N_TILE * MMA_N;
             int64_t aCol = K_TILE * MMA_K/8;
             uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
-            prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint32_t *>(weights_compressed + offset);
+            __pipeline_memcpy_async(prefetch_weights_compressed_two + cursor*(BLOCK_SIZE+1) + threadIdx.x, weights_compressed + offset, 4);
+
+            __pipeline_commit();
         }
 
         for (int64_t K_TILE = warpId; K_TILE < TILES_K; K_TILE += BLOCK_SIZE/WARP_SIZE) {
             int64_t cursor = K_TILE / (BLOCK_SIZE/WARP_SIZE) % PREFETCH_DIST;
 
+            __pipeline_wait_prior(PREFETCH_DIST - 1);
             *reinterpret_cast<uint64_t *>(B) = prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x];
             uint32_t weight_compressed_two = prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x];
 
@@ -117,12 +121,14 @@ decode_matmul_kernel(
             if (K_TILE_NEXT < TILES_K) {
                 int64_t bRow = M_TILE * MMA_M + (laneId/4);
                 int64_t bCol = K_TILE_NEXT * MMA_K + 8 * (laneId%4);
-                prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint64_t *>(x + bRow*GLOBAL_K + bCol);
+                __pipeline_memcpy_async(prefetch_x + cursor*(BLOCK_SIZE+1) + threadIdx.x, x + bRow*GLOBAL_K + bCol, 8);
 
                 int64_t aRow = N_TILE * MMA_N;
                 int64_t aCol = K_TILE_NEXT * MMA_K/8;
                 uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
-                prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x] = *reinterpret_cast<const uint32_t *>(weights_compressed + offset);
+                __pipeline_memcpy_async(prefetch_weights_compressed_two + cursor*(BLOCK_SIZE+1) + threadIdx.x, weights_compressed + offset, 4);
+
+                __pipeline_commit();
             }
 
             uint64_t decoded1 = decode8weights(weight_compressed_two & 0xFFFF, codebook_abs);
