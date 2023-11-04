@@ -93,26 +93,21 @@ decode_matmul_kernel(
             int64_t aRow = N_TILE * MMA_N;
             int64_t aCol = K_TILE * MMA_K/8;
 
-            uint16_t weight_compressed = weights_compressed[(aRow + (laneId/4)) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2))];
-            uint64_t decoded = decode8weights(weight_compressed, codebook_abs);
-            A[0] = laneId & 1 ? decoded >> 32 : decoded;    // we are wasting half of the computation here
+            // load two compressed weights at a time, each representing eight weight in int8
+            uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
+            uint32_t weight_compressed_two = *reinterpret_cast<const uint32_t *>(weights_compressed + offset);
 
-            weight_compressed = weights_compressed[(aRow + (laneId/4) + 8) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2))];
-            decoded = decode8weights(weight_compressed, codebook_abs);
-            A[1] = laneId & 1 ? decoded >> 32 : decoded;
+            uint64_t decoded1 = decode8weights(weight_compressed_two & 0xFFFF, codebook_abs);
+            uint64_t decoded2 = decode8weights((weight_compressed_two >> 16) & 0xFFFF, codebook_abs);
 
-            weight_compressed = weights_compressed[(aRow + (laneId/4)) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2) + 2)];
-            decoded = decode8weights(weight_compressed, codebook_abs);
-            A[2] = laneId & 1 ? decoded >> 32 : decoded;
-
-            weight_compressed = weights_compressed[(aRow + (laneId/4) + 8) * (GLOBAL_K/8) + (aCol+(laneId%4 / 2) + 2)];
-            decoded = decode8weights(weight_compressed, codebook_abs);
-            A[3] = laneId & 1 ? decoded >> 32 : decoded;
+            A[0] = decoded1;
+            A[1] = decoded2;
+            A[2] = decoded1 >> 32;
+            A[3] = decoded2 >> 32;
 
             int64_t bRow = M_TILE * MMA_M + (laneId / 4);
-            int64_t bCol = K_TILE * MMA_K + 4 * (laneId % 4);
-            B[0] = reinterpret_cast<const uint32_t *>(x + bRow*GLOBAL_K + bCol)[0];
-            B[1] = reinterpret_cast<const uint32_t *>(x + bRow*GLOBAL_K + bCol + 16)[0];
+            int64_t bCol = K_TILE * MMA_K + 8 * (laneId % 4);
+            *reinterpret_cast<uint64_t *>(B) = *reinterpret_cast<const uint64_t *>(x + bRow*GLOBAL_K + bCol);
 
             asm(
                 "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"

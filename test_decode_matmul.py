@@ -98,6 +98,19 @@ def build_x_weights(M, N, K, device):
     return x, weights_compressed
 
 
+def transpose_tile(weight_compressed):
+    N, K = weight_compressed.shape
+    weight_compressed = torch.reshape(weight_compressed, (N // 16, 16, K // 4, 4))
+    weight_compressed = torch.permute(weight_compressed, (0, 2, 1, 3))
+    weight_compressed = torch.reshape(weight_compressed, (N // 16, K // 4, 2, 8, 4))
+    weight_compressed = torch.permute(weight_compressed, (0, 1, 3, 4, 2))
+    weight_compressed = torch.reshape(weight_compressed, (N // 16, K // 4, 16, 4))
+    weight_compressed = torch.permute(weight_compressed, (0, 2, 1, 3))
+    weight_compressed = torch.reshape(weight_compressed, (N, K))
+    weight_compressed = weight_compressed.contiguous()
+    return weight_compressed
+
+
 def test_decode_matmul():
     device = torch.device("cuda")
 
@@ -106,6 +119,7 @@ def test_decode_matmul():
 
     M, N, K = 8, 8192, 8192
     x, weights_compressed = build_x_weights(M, N, K, device)
+    transposed = transpose_tile(weights_compressed)
 
     for _ in range(3):
         with Benchmark("CUDA"):
@@ -115,7 +129,8 @@ def test_decode_matmul():
     M, N, K = 8 * 2, 16 * 3, 32 * 5
     x, weights_compressed = build_x_weights(M, N, K, device)
 
-    result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
+    transposed = transpose_tile(weights_compressed)
+    result_cuda = decode_matmul_cuda(x, transposed, codebook_abs)
     result_naive = decode_matmul_torch(x, weights_compressed, codebook_abs)
     print("Correct:", torch.all(result_cuda == result_naive).item())
 
