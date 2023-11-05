@@ -130,17 +130,14 @@ decode_matmul_kernel(
             uint64_t decoded1 = decode8weights(weight_compressed_two & 0xFFFF, codebook_abs);
             uint64_t decoded2 = decode8weights((weight_compressed_two >> 16) & 0xFFFF, codebook_abs);
 
-            A[0] = decoded1;
-            A[1] = decoded2;
-            A[2] = decoded1 >> 32;
-            A[3] = decoded2 >> 32;
+            *reinterpret_cast<int4 *>(A) = make_int4(decoded1, decoded2, decoded1 >> 32, decoded2 >> 32);
 
             asm(
                 "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"
                 " { %0, %1, %2, %3 },"
                 " { %4, %5, %6, %7 },"
                 " { %8, %9 },"
-                " { %10, %11, %12, %13 };\n"
+                " { %10, %11, %12, %13 };"
                 : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
