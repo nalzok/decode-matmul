@@ -76,8 +76,8 @@ decode_matmul_kernel(
     int64_t warpId = threadIdx.x / WARP_SIZE;
     int64_t laneId = threadIdx.x % WARP_SIZE;
 
-    __shared__ uint32_t shared_scratch[BLOCK_SIZE/WARP_SIZE * MMA_M*MMA_N];
-    uint32_t* local_scratch = shared_scratch + warpId * MMA_M*MMA_N;
+    __shared__ uint32_t shared_scratch[BLOCK_SIZE/WARP_SIZE * (MMA_M*MMA_N+1)];
+    uint32_t* local_scratch = shared_scratch + warpId * (MMA_M*MMA_N+1);
 
     __shared__ uint64_t prefetch_x[PREFETCH_DIST * (BLOCK_SIZE+1)];
     __shared__ uint32_t prefetch_weights_compressed_two[PREFETCH_DIST * (BLOCK_SIZE+1)];
@@ -148,21 +148,23 @@ decode_matmul_kernel(
             );
         }
 
-        local_scratch[laneId%4 * 2 * MMA_N + laneId/4] = C[0];
-        local_scratch[laneId%4 * 2 * MMA_N + MMA_N + laneId/4] = C[1];
-        local_scratch[laneId%4 * 2 * MMA_N + laneId/4+8] = C[2];
-        local_scratch[laneId%4 * 2 * MMA_N + MMA_N + laneId/4+8] = C[3];
+        local_scratch[laneId*4] = C[0];
+        local_scratch[laneId*4+1] = C[1];
+        local_scratch[laneId*4+2] = C[2];
+        local_scratch[laneId*4+3] = C[3];
 
         __syncthreads();
 
-        for (int64_t i = threadIdx.x; i < MMA_M * MMA_N; i += BLOCK_SIZE) {
+        for (int64_t i = threadIdx.x; i < MMA_M*MMA_N; i += BLOCK_SIZE) {
             int32_t acc = 0;
             for (int64_t j = 0; j < BLOCK_SIZE/WARP_SIZE; j += 1) {
-                acc += shared_scratch[j * MMA_M * MMA_N + i];
+                acc += shared_scratch[j * (MMA_M*MMA_N+1) + i];
             }
 
-            int64_t cRow = M_TILE * MMA_M + i / MMA_N;
-            int64_t cCol = N_TILE * MMA_N + i % MMA_N;
+            int64_t rowIdx[] = {0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7};
+
+            int64_t cRow = M_TILE * MMA_M + rowIdx[i%16];
+            int64_t cCol = N_TILE * MMA_N + i/16 + (i%4/2) * 8;
             output[cRow*GLOBAL_N + cCol] = acc;
         }
     }

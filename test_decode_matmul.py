@@ -104,7 +104,7 @@ def transpose_tile(weight_compressed):
     weight_compressed = torch.permute(weight_compressed, (0, 2, 1, 3))
     weight_compressed = torch.reshape(weight_compressed, (N // 16, K // 4, 2, 8, 4))
     weight_compressed = torch.permute(weight_compressed, (0, 1, 3, 4, 2))
-    weight_compressed = torch.reshape(weight_compressed, (N, K))    # lol this is super unintuitive
+    weight_compressed = torch.reshape(weight_compressed, (N, K))    # lol this is super misleading
     weight_compressed = weight_compressed.contiguous()
     return weight_compressed
 
