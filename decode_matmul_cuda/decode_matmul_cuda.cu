@@ -102,9 +102,7 @@ decode_matmul_kernel(
             int64_t bCol = K_TILE * MMA_K + 8 * (laneId%4);
             __pipeline_memcpy_async(prefetch_x + cursor*(BLOCK_SIZE+1) + threadIdx.x, x + bRow*GLOBAL_K + bCol, 8);
 
-            int64_t aRow = N_TILE * MMA_N;
-            int64_t aCol = K_TILE * MMA_K/8;
-            uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
+            uint64_t offset = (N_TILE * TILES_K + K_TILE) * (MMA_N * MMA_K/8) + laneId * 2;
             __pipeline_memcpy_async(prefetch_weights_compressed_two + cursor*(BLOCK_SIZE+1) + threadIdx.x, weights_compressed + offset, 4);
 
             __pipeline_commit();
@@ -123,9 +121,7 @@ decode_matmul_kernel(
                 int64_t bCol = K_TILE_NEXT * MMA_K + 8 * (laneId%4);
                 __pipeline_memcpy_async(prefetch_x + cursor*(BLOCK_SIZE+1) + threadIdx.x, x + bRow*GLOBAL_K + bCol, 8);
 
-                int64_t aRow = N_TILE * MMA_N;
-                int64_t aCol = K_TILE_NEXT * MMA_K/8;
-                uint64_t offset = (aRow + (laneId/2)) * (GLOBAL_K/8) + (aCol+laneId%2*2);
+                uint64_t offset = (N_TILE * TILES_K + K_TILE_NEXT) * (MMA_N * MMA_K/8) + laneId * 2;
                 __pipeline_memcpy_async(prefetch_weights_compressed_two + cursor*(BLOCK_SIZE+1) + threadIdx.x, weights_compressed + offset, 4);
 
                 __pipeline_commit();
