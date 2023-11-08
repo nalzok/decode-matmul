@@ -25,6 +25,9 @@ using namespace nvcuda;
 #define BLOCK_SIZE              1024
 #define WARP_SIZE               32
 #define PREFETCH_DIST           2
+#define BLOCKS_PER_TILE         2
+
+#define WARPS_PER_BLOCK         (BLOCK_SIZE/WARP_SIZE)
 
 #define SMEM_SIZE_MAX           (48 * 1024)
 
@@ -76,7 +79,7 @@ decode_matmul_kernel(
     int64_t warpId = threadIdx.x / WARP_SIZE;
     int64_t laneId = threadIdx.x % WARP_SIZE;
 
-    __shared__ uint32_t shared_scratch[BLOCK_SIZE/WARP_SIZE * (MMA_M*MMA_N+1)];
+    __shared__ uint32_t shared_scratch[WARPS_PER_BLOCK * (MMA_M*MMA_N+1)];
     uint32_t* local_scratch = shared_scratch + warpId * (MMA_M*MMA_N+1);
 
     __shared__ uint64_t prefetch_x[PREFETCH_DIST * (BLOCK_SIZE+1)];
@@ -86,17 +89,18 @@ decode_matmul_kernel(
     int64_t TILES_N = GLOBAL_N / MMA_N;
     int64_t TILES_K = GLOBAL_K / MMA_K;
 
-    uint32_t A[4];
-    uint32_t B[2];
-    int32_t C[4] = {};
+    for (int64_t blockPos = blockIdx.x; blockPos < TILES_M*TILES_N*BLOCKS_PER_TILE; blockPos += gridDim.x) {
+        int64_t M_TILE = (blockPos / BLOCKS_PER_TILE) / TILES_N;
+        int64_t N_TILE = (blockPos / BLOCKS_PER_TILE) % TILES_N;
+        int64_t K_TILE_BASE = (blockPos % BLOCKS_PER_TILE) * WARPS_PER_BLOCK;    // each warp handles a tile
 
-    for (int64_t blockPos = blockIdx.x; blockPos < TILES_M * TILES_N; blockPos += gridDim.x) {
-        int64_t M_TILE = blockPos / TILES_N;
-        int64_t N_TILE = blockPos % TILES_N;
+        uint32_t A[4];
+        uint32_t B[2];
+        int32_t C[4] = {};
 
         // fill the prefetch buffer
         for (int64_t cursor = 0; cursor < PREFETCH_DIST; cursor += 1) {
-            int64_t K_TILE = warpId + cursor * BLOCK_SIZE/WARP_SIZE;
+            int64_t K_TILE = K_TILE_BASE + cursor * BLOCKS_PER_TILE * WARPS_PER_BLOCK + warpId;
 
             int64_t bRow = M_TILE * MMA_M + (laneId/4);
             int64_t bCol = K_TILE * MMA_K + 8 * (laneId%4);
@@ -108,14 +112,15 @@ decode_matmul_kernel(
             __pipeline_commit();
         }
 
-        for (int64_t K_TILE = warpId; K_TILE < TILES_K; K_TILE += BLOCK_SIZE/WARP_SIZE) {
-            int64_t cursor = K_TILE / (BLOCK_SIZE/WARP_SIZE) % PREFETCH_DIST;
+        for (int64_t pos = 0; pos < TILES_K / (BLOCKS_PER_TILE * WARPS_PER_BLOCK); pos += 1) {
+            int64_t K_TILE = K_TILE_BASE + pos * BLOCKS_PER_TILE * WARPS_PER_BLOCK + warpId;
+            int64_t cursor = pos % PREFETCH_DIST;
 
             __pipeline_wait_prior(PREFETCH_DIST - 1);
             *reinterpret_cast<uint64_t *>(B) = prefetch_x[cursor * (BLOCK_SIZE+1) + threadIdx.x];
             uint32_t weight_compressed_two = prefetch_weights_compressed_two[cursor * (BLOCK_SIZE+1) + threadIdx.x];
 
-            int64_t K_TILE_NEXT = K_TILE + PREFETCH_DIST * BLOCK_SIZE/WARP_SIZE;
+            int64_t K_TILE_NEXT = K_TILE + PREFETCH_DIST * BLOCKS_PER_TILE * WARPS_PER_BLOCK;
             if (K_TILE_NEXT < TILES_K) {
                 int64_t bRow = M_TILE * MMA_M + (laneId/4);
                 int64_t bCol = K_TILE_NEXT * MMA_K + 8 * (laneId%4);
@@ -154,7 +159,7 @@ decode_matmul_kernel(
 
         for (int64_t i = threadIdx.x; i < MMA_M*MMA_N; i += BLOCK_SIZE) {
             int32_t acc = 0;
-            for (int64_t j = 0; j < BLOCK_SIZE/WARP_SIZE; j += 1) {
+            for (int64_t j = 0; j < WARPS_PER_BLOCK; j += 1) {
                 acc += shared_scratch[j * (MMA_M*MMA_N+1) + i];
             }
 
@@ -162,7 +167,7 @@ decode_matmul_kernel(
 
             int64_t cRow = M_TILE * MMA_M + rowIdx[i%16];
             int64_t cCol = N_TILE * MMA_N + i/16 + (i%4/2) * 8;
-            output[cRow*GLOBAL_N + cCol] = acc;
+            atomicAdd(output + cRow*GLOBAL_N + cCol, acc);
         }
     }
 }
@@ -187,7 +192,17 @@ __host__ torch::Tensor decode_matmul(
 
     TORCH_CHECK(GLOBAL_M % MMA_M == 0, "GLOBAL_M is not divisible by MMA_M");
     TORCH_CHECK(GLOBAL_N % MMA_N == 0, "GLOBAL_N is not divisible by MMA_N");
-    TORCH_CHECK(GLOBAL_K % (MMA_K * PREFETCH_DIST) == 0, "GLOBAL_K is not divisible by (MMA_K * PREFETCH_DIST)");
+    TORCH_CHECK(GLOBAL_K % MMA_K == 0, "GLOBAL_K is not divisible by MMA_K");
+
+    int64_t TILES_K = GLOBAL_K / MMA_K;
+    TORCH_CHECK(
+        TILES_K % (BLOCKS_PER_TILE * WARPS_PER_BLOCK) == 0,
+        "TILES_K is not divisible by (BLOCKS_PER_TILE * WARPS_PER_BLOCK)"
+    );
+    TORCH_CHECK(
+        TILES_K / (BLOCKS_PER_TILE * WARPS_PER_BLOCK) >= PREFETCH_DIST,
+        "TILES_K / (BLOCKS_PER_TILE * WARPS_PER_BLOCK) is smaller than PREFETCH_DIST"
+    );
 
     at::DeviceGuard guard(x.device());
     torch::TensorOptions options = torch::TensorOptions()
@@ -199,7 +214,7 @@ __host__ torch::Tensor decode_matmul(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, x.get_device());
-    int64_t grid_size = static_cast<int64_t>(deviceProp.multiProcessorCount);
+    int64_t grid_size = static_cast<int64_t>(GLOBAL_N/MMA_N * BLOCKS_PER_TILE);
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
     decode_matmul_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(

@@ -323,3 +323,9 @@ tags
 
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,linux,vim,cuda,c++,c
 
+decode_matmul_cuda/decode_matmul_cuda.cudafe1.c
+decode_matmul_cuda/decode_matmul_cuda.cudafe1.cpp
+decode_matmul_cuda/decode_matmul_cuda.cudafe1.stub.c
+decode_matmul_cuda/decode_matmul_cuda.fatbin.c
+report*.nsys-rep
+report*.sqlite

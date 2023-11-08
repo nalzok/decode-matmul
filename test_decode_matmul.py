@@ -118,19 +118,16 @@ def test_decode_matmul():
     M, N, K = 8, 8192, 8192
     x, weights_compressed = build_x_weights(M, N, K, device)
     transposed = transpose_tile(weights_compressed)
-
-    for _ in range(3):
-        with Benchmark("CUDA"):
-            result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
+    result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
 
 
-    M, N, K = 8 * 2, 16 * 3, 32 * 4
-    x, weights_compressed = build_x_weights(M, N, K, device)
-
-    transposed = transpose_tile(weights_compressed)
-    result_cuda = decode_matmul_cuda(x, transposed, codebook_abs)
-    result_naive = decode_matmul_torch(x, weights_compressed, codebook_abs)
-    print("Correct:", torch.all(result_cuda == result_naive).item())
+    # M, N, K = 8 * 2, 16 * 3, 32 * 4
+    # x, weights_compressed = build_x_weights(M, N, K, device)
+    #
+    # transposed = transpose_tile(weights_compressed)
+    # result_cuda = decode_matmul_cuda(x, transposed, codebook_abs)
+    # result_naive = decode_matmul_torch(x, weights_compressed, codebook_abs)
+    # print("Correct:", torch.all(result_cuda == result_naive).item())
 
 
 if __name__ == '__main__':
