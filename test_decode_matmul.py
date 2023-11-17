@@ -115,19 +115,27 @@ def test_decode_matmul():
     codebook_abs = build_codebook_abs(device)
 
 
+    # FIXME: the result is incorrect if you uncomment the call to decode_matmul_cuda,
+    #        OR comment out `x, weights_compressed = build_x_weights(M, N, K, device)`
+    #        That doesn't make any sense. I know.
     M, N, K = 8, 8192, 8192
     x, weights_compressed = build_x_weights(M, N, K, device)
-    transposed = transpose_tile(weights_compressed)
-    result_cuda = decode_matmul_cuda(x, weights_compressed, codebook_abs)
-
-
-    # M, N, K = 8 * 2, 16 * 3, 32 * 4
-    # x, weights_compressed = build_x_weights(M, N, K, device)
-    #
     # transposed = transpose_tile(weights_compressed)
     # result_cuda = decode_matmul_cuda(x, transposed, codebook_abs)
-    # result_naive = decode_matmul_torch(x, weights_compressed, codebook_abs)
-    # print("Correct:", torch.all(result_cuda == result_naive).item())
+
+    MMA_M, MMA_N, MMA_K = 8, 16, 32
+    BLOCKS_PER_TILE = 2
+    BLOCK_SIZE = 1024
+    WARP_SIZE = 32
+    PREFETCH_DIST = 2
+
+    M, N, K = MMA_M, MMA_N, MMA_K * BLOCKS_PER_TILE * BLOCK_SIZE // WARP_SIZE * PREFETCH_DIST
+    x, weights_compressed = build_x_weights(M, N, K, device)
+
+    transposed = transpose_tile(weights_compressed)
+    result_cuda = decode_matmul_cuda(x, transposed, codebook_abs)
+    result_naive = decode_matmul_torch(x, weights_compressed, codebook_abs)
+    print("Correct:", torch.all(result_cuda == result_naive).item())
 
 
 if __name__ == '__main__':

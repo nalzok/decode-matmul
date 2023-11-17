@@ -11,7 +11,7 @@ if torch.cuda.is_available() and CUDA_HOME is not None:
             'decode_matmul_cuda.cu',
         ],
         extra_compile_args={'cxx': ['-O3'],
-                            'nvcc': ['-O3', '-keep']})
+                            'nvcc': ['-Xcompiler', '-O3', '-Xptxas', '-O3,-v', '-use_fast_math', '-keep']})
     ext_modules.append(extension)
 
 setup(

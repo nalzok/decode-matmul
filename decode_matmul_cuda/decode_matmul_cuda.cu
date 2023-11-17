@@ -92,15 +92,17 @@ decode_matmul_kernel(
     for (int64_t blockPos = blockIdx.x; blockPos < TILES_M*TILES_N*BLOCKS_PER_TILE; blockPos += gridDim.x) {
         int64_t M_TILE = (blockPos / BLOCKS_PER_TILE) / TILES_N;
         int64_t N_TILE = (blockPos / BLOCKS_PER_TILE) % TILES_N;
-        int64_t K_TILE_BASE = (blockPos % BLOCKS_PER_TILE) * WARPS_PER_BLOCK;    // each warp handles a tile
+        int64_t K_TILE_OFFSET = blockPos % BLOCKS_PER_TILE;
 
         uint32_t A[4];
         uint32_t B[2];
         int32_t C[4] = {};
 
+        int64_t ITERATIONS_PER_WARP = TILES_K / (BLOCKS_PER_TILE * WARPS_PER_BLOCK);
+
         // fill the prefetch buffer
         for (int64_t cursor = 0; cursor < PREFETCH_DIST; cursor += 1) {
-            int64_t K_TILE = K_TILE_BASE + cursor * BLOCKS_PER_TILE * WARPS_PER_BLOCK + warpId;
+            int64_t K_TILE = (K_TILE_OFFSET * ITERATIONS_PER_WARP + cursor) * WARPS_PER_BLOCK + warpId;
 
             int64_t bRow = M_TILE * MMA_M + (laneId/4);
             int64_t bCol = K_TILE * MMA_K + 8 * (laneId%4);
@@ -112,8 +114,8 @@ decode_matmul_kernel(
             __pipeline_commit();
         }
 
-        for (int64_t pos = 0; pos < TILES_K / (BLOCKS_PER_TILE * WARPS_PER_BLOCK); pos += 1) {
-            int64_t K_TILE = K_TILE_BASE + pos * BLOCKS_PER_TILE * WARPS_PER_BLOCK + warpId;
+        for (int64_t pos = 0; pos < ITERATIONS_PER_WARP; pos += 1) {
+            int64_t K_TILE = (K_TILE_OFFSET * ITERATIONS_PER_WARP + pos) * WARPS_PER_BLOCK + warpId;
             int64_t cursor = pos % PREFETCH_DIST;
 
             __pipeline_wait_prior(PREFETCH_DIST - 1);
